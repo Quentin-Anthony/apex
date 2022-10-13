@@ -1,5 +1,8 @@
 import torch
 from apex.multi_tensor_apply import multi_tensor_applier
+from compression import compressors
+import allreducer as ar
+import time
 
 class FusedLAMB(torch.optim.Optimizer):
 
@@ -64,7 +67,7 @@ class FusedLAMB(torch.optim.Optimizer):
                  betas=(0.9, 0.999), eps=1e-6, weight_decay=0.01,
                  amsgrad=False, adam_w_mode=True,
                  grad_averaging=True, set_grad_none=True,
-                 max_grad_norm=1.0, use_nvlamb=False):
+                 max_grad_norm=1.0, use_nvlamb=False, density=1.0, compressor='none', rank=-1):
         if amsgrad:
             raise RuntimeError('FusedLAMB does not support the AMSGrad variant.')
         defaults = dict(lr=lr, bias_correction=bias_correction,
@@ -84,6 +87,18 @@ class FusedLAMB(torch.optim.Optimizer):
         self.adam_w_mode = 1 if adam_w_mode else 0
         self.set_grad_none = set_grad_none
         self.use_nvlamb = use_nvlamb
+        self.density = density
+        self.rank = rank
+
+        self.grad_shapes = []
+        self.grad_sizes = []
+        self.counter = 0
+        if compressor == 'none':
+            is_sparse = False
+        else:
+            is_sparse = True
+        self.compressor = compressors[compressor]
+        self.allreducer = ar.AllReducer(compression=self.compressor, sparse=is_sparse, density=density)
 
     def zero_grad(self):
         if self.set_grad_none:
@@ -104,18 +119,32 @@ class FusedLAMB(torch.optim.Optimizer):
         if closure is not None:
             loss = closure()
 
+        grads = []
+        grad_shapes, grad_sizes = [], []
         # create separate grad lists for fp32 and fp16 params
         g_all_32, g_all_16 = [], []
         for group in self.param_groups:
             for p in group['params']:
                 if p.grad is None:
                     continue
+                if self.counter == 0:
+                    self.grad_shapes.append(p.grad.data.shape)
+                    self.grad_sizes.append(torch.numel(p.grad.data))
+                grads.append(p.grad.data.view(-1))
                 if p.dtype == torch.float32:
                     g_all_32.append(p.grad.data)
                 elif p.dtype == torch.float16:
                     g_all_16.append(p.grad.data)
                 else:
                     raise RuntimeError('FusedLAMB only support fp16 and fp32.')
+        self.counter += 1
+        all_grads = torch.cat(grads)
+        print("total gradients size of allreduce: ", torch.numel(all_grads), "number of gradients: ", len(self.grad_shapes), "gradients sizes: ", self.grad_sizes)
+        start_time = time.time()
+        all_grads_red = self.allreducer.run(all_grads)
+        if self.rank == 0:
+            print("counter: ", self.counter, "allreducer time: ", (time.time()-start_time))
+        split_all_grads = torch.split(all_grads_red, self.grad_sizes)
 
         device = self.param_groups[0]["params"][0].device
         g_norm_32, g_norm_16 = torch.zeros(1, device=device), torch.zeros(1, device=device)
@@ -136,6 +165,7 @@ class FusedLAMB(torch.optim.Optimizer):
                                                 False)[0]
         max_grad_norm = self.defaults['max_grad_norm']
 
+        indx = 0
         for group in self.param_groups:
             bias_correction = 1 if group['bias_correction'] else 0
             beta1, beta2 = group['betas']
@@ -158,6 +188,11 @@ class FusedLAMB(torch.optim.Optimizer):
                 if p.grad.data.is_sparse:
                     raise RuntimeError('FusedLAMB does not support sparse gradients, please consider SparseAdam instead')
 
+                grad = split_all_grads[indx].view(self.grad_shapes[indx])
+                assert grad.shape == p.grad.data.shape
+
+                indx += 1
+
                 state = self.state[p]
                 # State initialization
                 if len(state) == 0:
@@ -167,12 +202,12 @@ class FusedLAMB(torch.optim.Optimizer):
                     state['exp_avg_sq'] = torch.zeros_like(p.data)
 
                 if p.dtype == torch.float16:
-                    g_16.append(p.grad.data)
+                    g_16.append(grad.data)
                     p_16.append(p.data)
                     m_16.append(state['exp_avg'])
                     v_16.append(state['exp_avg_sq'])
                 elif p.dtype == torch.float32:
-                    g_32.append(p.grad.data)
+                    g_32.append(grad.data)
                     p_32.append(p.data)
                     m_32.append(state['exp_avg'])
                     v_32.append(state['exp_avg_sq'])
